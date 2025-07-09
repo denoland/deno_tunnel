@@ -1,0 +1,19 @@
+# Copyright 2018-2025 the Deno authors. MIT license.
+
+[package]
+name = "deno_tunnel"
+version = "0.1.0"
+authors = ["the Deno authors"]
+edition = "2024"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/denoland/deno_tunnel"
+description = "Deno Tunnels"
+
+[dependencies]
+pin-project = "1.1"
+quinn = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0"
+tokio = { version = "1.46", features = ["full"] }
