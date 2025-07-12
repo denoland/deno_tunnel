@@ -2,7 +2,7 @@
 
 [package]
 name = "deno_tunnel"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["the Deno authors"]
 edition = "2024"
 license = "MIT"
@@ -12,7 +12,7 @@ description = "Deno Tunnels"
 
 [dependencies]
 pin-project = "1.1"
-quinn = "0.11"
+quinn = { version = "0.11", default-features = false, features = ["bloom", "log", "runtime-tokio", "rustls-aws-lc-rs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0"
