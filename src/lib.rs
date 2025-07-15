@@ -131,6 +131,9 @@ pub enum Authentication {
     org: String,
     app: String,
   },
+  Cluster {
+    token: String,
+  },
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +188,9 @@ impl TunnelConnection {
       match authentication {
         Authentication::App { token, org, app } => {
           ControlMessage::AuthenticateApp { token, org, app }
+        }
+        Authentication::Cluster { token } => {
+          ControlMessage::AuthenticateCluster { token }
         }
       },
     )
@@ -461,6 +467,9 @@ pub enum ControlMessage {
     token: String,
     org: String,
     app: String,
+  },
+  AuthenticateCluster {
+    token: String,
   },
   Authenticated {
     metadata: HashMap<String, String>,
