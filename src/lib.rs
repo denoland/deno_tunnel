@@ -95,6 +95,12 @@ impl TunnelAddr {
   }
 }
 
+impl From<TunnelAddr> for SocketAddr {
+  fn from(addr: TunnelAddr) -> Self {
+    addr.socket
+  }
+}
+
 /// Data obtained from the server handshake
 #[derive(Debug)]
 pub struct Metadata {
@@ -136,6 +142,21 @@ pub enum Authentication {
   },
 }
 
+pub type ConnectResult = std::io::Result<std::net::UdpSocket>;
+
+pub trait Connector: Send + Sync {
+  fn connect(&self) -> std::pin::Pin<Box<impl Future<Output = ConnectResult>>>;
+}
+
+impl<A> Connector for A
+where
+  A: std::net::ToSocketAddrs + Send + Sync,
+{
+  fn connect(&self) -> std::pin::Pin<Box<impl Future<Output = ConnectResult>>> {
+    Box::pin(async move { std::net::UdpSocket::bind(self) })
+  }
+}
+
 #[derive(Debug, Clone)]
 pub struct TunnelConnection {
   endpoint: quinn::Endpoint,
@@ -147,11 +168,28 @@ impl TunnelConnection {
   pub async fn connect(
     addr: std::net::SocketAddr,
     server_name: &str,
+    tls_config: quinn::rustls::ClientConfig,
+    authentication: Authentication,
+  ) -> Result<(Self, Metadata, Events), Error> {
+    Self::connect_with_connector(
+      ("::", 0),
+      addr,
+      server_name,
+      tls_config,
+      authentication,
+    )
+    .await
+  }
+
+  pub async fn connect_with_connector(
+    connector: impl Connector,
+    addr: std::net::SocketAddr,
+    server_name: &str,
     mut tls_config: quinn::rustls::ClientConfig,
     authentication: Authentication,
   ) -> Result<(Self, Metadata, Events), Error> {
     let config = quinn::EndpointConfig::default();
-    let socket = std::net::UdpSocket::bind(("::", 0))?;
+    let socket = connector.connect().await?;
     let endpoint = quinn::Endpoint::new(
       config,
       None,
