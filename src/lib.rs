@@ -3,14 +3,13 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::net::UdpSocket;
 use std::sync::Arc;
 use std::time::Duration;
 
 use quinn::crypto::rustls::QuicClientConfig;
 use tokio::io::AsyncRead;
-use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
-use tokio::io::AsyncWriteExt;
 
 pub use quinn;
 
@@ -22,22 +21,22 @@ pub const CLOSE_UNAUTHORIZED: u32 = 2;
 pub const CLOSE_NOT_FOUND: u32 = 3;
 pub const CLOSE_MIGRATE: u32 = 4;
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, Clone)]
 pub enum Error {
   #[error(transparent)]
-  StdIo(#[from] std::io::Error),
+  StdIo(Arc<std::io::Error>),
   #[error(transparent)]
-  SerdeJson(#[from] serde_json::Error),
+  SerdeJson(Arc<serde_json::Error>),
   #[error(transparent)]
   QuinnConnect(#[from] quinn::ConnectError),
   #[error(transparent)]
   QuinnConnection(quinn::ConnectionError),
   #[error(transparent)]
-  QuinnRead(#[from] quinn::ReadError),
+  QuinnRead(quinn::ReadError),
   #[error(transparent)]
-  QuinnReadExact(#[from] quinn::ReadExactError),
+  QuinnReadExact(quinn::ReadExactError),
   #[error(transparent)]
-  QuinnWrite(#[from] quinn::WriteError),
+  QuinnWrite(quinn::WriteError),
 
   #[error("Unsupported version")]
   UnsupportedVersion,
@@ -67,6 +66,47 @@ impl From<quinn::ConnectionError> for Error {
       }
       _ => Self::QuinnConnection(value),
     }
+  }
+}
+
+impl From<quinn::ReadExactError> for Error {
+  fn from(value: quinn::ReadExactError) -> Self {
+    match value {
+      quinn::ReadExactError::FinishedEarly(..) => Self::QuinnReadExact(value),
+      quinn::ReadExactError::ReadError(e) => Self::from(e),
+    }
+  }
+}
+
+impl From<quinn::ReadError> for Error {
+  fn from(value: quinn::ReadError) -> Self {
+    if let quinn::ReadError::ConnectionLost(e) = value {
+      Self::from(e)
+    } else {
+      Self::QuinnRead(value)
+    }
+  }
+}
+
+impl From<quinn::WriteError> for Error {
+  fn from(value: quinn::WriteError) -> Self {
+    if let quinn::WriteError::ConnectionLost(e) = value {
+      Self::from(e)
+    } else {
+      Self::QuinnWrite(value)
+    }
+  }
+}
+
+impl From<std::io::Error> for Error {
+  fn from(value: std::io::Error) -> Self {
+    Self::StdIo(Arc::new(value))
+  }
+}
+
+impl From<serde_json::Error> for Error {
+  fn from(value: serde_json::Error) -> Self {
+    Self::SerdeJson(Arc::new(value))
   }
 }
 
@@ -102,7 +142,7 @@ impl From<TunnelAddr> for SocketAddr {
 }
 
 /// Data obtained from the server handshake
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Metadata {
   pub hostnames: Vec<String>,
   pub env: HashMap<String, String>,
@@ -110,11 +150,17 @@ pub struct Metadata {
 }
 
 /// Server event
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Event {
   /// All endpoints are routed
   Routed,
-  /// The client should migrate to a new connection
+  /// Client will reconnect after the given duration
+  Reconnect(Duration),
+}
+
+enum InternalEvent {
+  Routed,
   Migrate,
 }
 
@@ -130,7 +176,7 @@ impl Events {
   }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Authentication {
   App {
     token: String,
@@ -142,88 +188,33 @@ pub enum Authentication {
   },
 }
 
-pub type ConnectResult = std::io::Result<std::net::UdpSocket>;
-
-pub trait Connector: Send + Sync {
-  fn connect(&self) -> std::pin::Pin<Box<impl Future<Output = ConnectResult>>>;
-}
-
-impl<A> Connector for A
-where
-  A: std::net::ToSocketAddrs + Send + Sync,
-{
-  fn connect(&self) -> std::pin::Pin<Box<impl Future<Output = ConnectResult>>> {
-    Box::pin(async move { std::net::UdpSocket::bind(self) })
-  }
-}
-
-#[derive(Debug, Clone)]
-pub struct TunnelConnection {
-  endpoint: quinn::Endpoint,
+#[derive(Debug)]
+struct InnerConnection {
   connection: quinn::Connection,
   local_addr: TunnelAddr,
+  metadata: Metadata,
 }
 
-impl TunnelConnection {
-  pub async fn connect(
-    addr: std::net::SocketAddr,
-    server_name: &str,
-    tls_config: quinn::rustls::ClientConfig,
-    authentication: Authentication,
-  ) -> Result<(Self, Metadata, Events), Error> {
-    Self::connect_with_connector(
-      ("::", 0),
-      addr,
-      server_name,
-      tls_config,
-      authentication,
-    )
-    .await
-  }
-
-  pub async fn connect_with_connector(
-    connector: impl Connector,
-    addr: std::net::SocketAddr,
-    server_name: &str,
-    mut tls_config: quinn::rustls::ClientConfig,
-    authentication: Authentication,
-  ) -> Result<(Self, Metadata, Events), Error> {
-    let config = quinn::EndpointConfig::default();
-    let socket = connector.connect().await?;
-    let endpoint = quinn::Endpoint::new(
-      config,
-      None,
-      socket,
-      quinn::default_runtime().unwrap(),
-    )?;
-
-    tls_config.alpn_protocols = vec!["🦕🕳️".into()];
-    tls_config.enable_early_data = true;
-
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
-    transport_config
-      .max_idle_timeout(Some(Duration::from_secs(15).try_into().unwrap()));
-
-    let client_config =
-      QuicClientConfig::try_from(tls_config).expect("TLS13 supported");
-    let mut client_config = quinn::ClientConfig::new(Arc::new(client_config));
-    client_config.transport_config(Arc::new(transport_config));
-
-    let connecting = endpoint.connect_with(client_config, addr, server_name)?;
+impl InnerConnection {
+  async fn connect(
+    outer: TunnelConnection,
+  ) -> Result<(Self, tokio::sync::mpsc::Receiver<InternalEvent>), Error> {
+    let connecting = outer
+      .endpoint
+      .connect(outer.connect_info.addr, &outer.connect_info.server_name)?;
 
     let connection = connecting.await?;
 
     let mut control = connection.open_bi().await?;
-    control.0.write_u32_le(VERSION).await?;
-    if control.1.read_u32_le().await? != VERSION {
+    write_u32_le(&mut control.0, VERSION).await?;
+    if read_u32_le(&mut control.1).await? != VERSION {
       return Err(Error::UnsupportedVersion);
     }
 
     write_message(&mut control.0, StreamHeader::Control {}).await?;
     write_message(
       &mut control.0,
-      match authentication {
+      match outer.connect_info.authentication.clone() {
         Authentication::App { token, org, app } => {
           ControlMessage::AuthenticateApp { token, org, app }
         }
@@ -248,8 +239,8 @@ impl TunnelConnection {
     tokio::spawn(async move {
       while let Ok(message) = read_message(&mut control.1).await {
         let event = match message {
-          ControlMessage::Routed {} => Event::Routed,
-          ControlMessage::Migrate {} => Event::Migrate,
+          ControlMessage::Routed {} => InternalEvent::Routed,
+          ControlMessage::Migrate {} => InternalEvent::Migrate,
           _ => {
             continue;
           }
@@ -270,66 +261,362 @@ impl TunnelConnection {
       env,
       metadata,
     };
-    let routed = Events { event_rx };
 
     Ok((
       Self {
-        endpoint,
         connection,
         local_addr,
+        metadata,
       },
-      metadata,
-      routed,
+      event_rx,
     ))
   }
 }
 
+#[derive(Debug)]
+struct ConnectInfo {
+  authentication: Authentication,
+  addr: SocketAddr,
+  server_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TunnelConnection {
+  endpoint: quinn::Endpoint,
+  connect_info: Arc<ConnectInfo>,
+  active:
+    tokio::sync::watch::Sender<Option<Result<Arc<InnerConnection>, Error>>>,
+}
+
 impl TunnelConnection {
-  pub fn local_addr(&self) -> Result<TunnelAddr, std::io::Error> {
-    Ok(self.local_addr.clone())
+  pub async fn connect(
+    addr: std::net::SocketAddr,
+    server_name: String,
+    tls_config: quinn::rustls::ClientConfig,
+    authentication: Authentication,
+  ) -> Result<(Self, Events), Error> {
+    Self::connect_with(
+      UdpSocket::bind(("::", 0))?,
+      addr,
+      server_name,
+      tls_config,
+      authentication,
+    )
+    .await
   }
 
+  pub async fn connect_with(
+    socket: UdpSocket,
+    addr: std::net::SocketAddr,
+    server_name: String,
+    mut tls_config: quinn::rustls::ClientConfig,
+    authentication: Authentication,
+  ) -> Result<(Self, Events), Error> {
+    let config = quinn::EndpointConfig::default();
+    let mut endpoint = quinn::Endpoint::new(
+      config,
+      None,
+      socket,
+      quinn::default_runtime().unwrap(),
+    )?;
+
+    tls_config.alpn_protocols = vec!["🦕🕳️".into()];
+    tls_config.enable_early_data = true;
+
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+    transport_config
+      .max_idle_timeout(Some(Duration::from_secs(15).try_into().unwrap()));
+
+    let client_config =
+      QuicClientConfig::try_from(tls_config).expect("TLS13 supported");
+    let mut client_config = quinn::ClientConfig::new(Arc::new(client_config));
+    client_config.transport_config(Arc::new(transport_config));
+
+    endpoint.set_default_client_config(client_config);
+
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(1);
+
+    let this = Self {
+      endpoint,
+      connect_info: Arc::new(ConnectInfo {
+        authentication,
+        addr,
+        server_name,
+      }),
+      active: tokio::sync::watch::channel(None).0,
+    };
+
+    tokio::spawn({
+      let this = this.clone();
+      async move {
+        let this2 = this.clone();
+        let r = async move {
+          let mut retries = 0;
+          let mut watch = this.active.subscribe();
+
+          'outer: loop {
+            if matches!(this.active.borrow().as_ref(), Some(Err(_))) {
+              break;
+            }
+
+            if retries > 0 {
+              let d = Duration::from_secs((retries * 3).min(30));
+              let event_tx = event_tx.clone();
+              tokio::spawn(async move {
+                let _ = event_tx.send(Event::Reconnect(d)).await;
+              });
+              let s = tokio::time::sleep(d);
+              tokio::pin!(s);
+              loop {
+                tokio::select! {
+                  _ = &mut s => break,
+                  _ = watch.changed() => {
+                    if matches!(watch.borrow().as_ref(), Some(Err(_))) {
+                      break 'outer;
+                    }
+                  }
+                }
+              }
+            }
+
+            let (inner, mut event_rx) =
+              match InnerConnection::connect(this.clone()).await {
+                Ok(r) => r,
+                Err(e) => {
+                  if let Error::QuinnConnection(qe) = &e {
+                    if is_retry_error(qe) {
+                      retries += 1;
+                      continue;
+                    } else {
+                      return Err(e);
+                    }
+                  } else {
+                    return Err(e);
+                  }
+                }
+              };
+
+            let existing = this.active.borrow().clone();
+            if matches!(existing.as_ref(), Some(Err(_))) {
+              inner.connection.close(0u32.into(), b"");
+              break;
+            }
+
+            let c = inner.connection.clone();
+            this.active.send_replace(Some(Ok(Arc::new(inner))));
+
+            if let Some(Ok(existing)) = existing.as_ref() {
+              existing.connection.close(CLOSE_MIGRATE.into(), b"migrated");
+            }
+
+            retries = 0;
+
+            let e = loop {
+              tokio::select! {
+                e = c.closed() => break e,
+                Some(event) = event_rx.recv() => {
+                  match event {
+                    InternalEvent::Migrate => {
+                      retries = 0;
+                      continue 'outer;
+                    }
+                    InternalEvent::Routed => {
+                      let event_tx = event_tx.clone();
+                      tokio::spawn(async move {
+                        let _ = event_tx.send(Event::Routed).await;
+                      });
+                    }
+                  }
+                }
+                _ = watch.changed() => {
+                  if matches!(this.active.borrow().as_ref(), Some(Err(_))) {
+                    break 'outer;
+                  }
+                }
+              }
+            };
+
+            if is_retry_error(&e) {
+              this.active.send_replace(None);
+              retries += 1;
+            } else {
+              return Err(e.into());
+            }
+          }
+
+          Ok(())
+        };
+
+        if let Err(e) = r.await {
+          this2.active.send_replace(Some(Err(e)));
+        }
+      }
+    });
+
+    this.active().await?;
+
+    let events = Events { event_rx };
+
+    Ok((this, events))
+  }
+}
+
+impl TunnelConnection {
+  // compat method with other common connection types, keep signature the same
+  pub fn local_addr(&self) -> Result<TunnelAddr, std::io::Error> {
+    if let Some(Ok(inner)) = self.active.borrow().as_ref() {
+      return Ok(inner.local_addr.clone());
+    }
+    let socket = self.endpoint.local_addr()?;
+    Ok(TunnelAddr {
+      hostname: None,
+      socket,
+    })
+  }
+
+  async fn active(&self) -> Result<Arc<InnerConnection>, Error> {
+    // fast path, check without subscribing
+    if let Some(inner) = self.active.borrow().as_ref() {
+      match inner {
+        Ok(inner) => match inner.connection.close_reason() {
+          None => return Ok(inner.clone()),
+          Some(e) => {
+            if !is_retry_error(&e) {
+              return Err(e.into());
+            }
+          }
+        },
+        Err(e) => {
+          return Err(e.clone());
+        }
+      }
+    }
+
+    let mut w = self.active.subscribe();
+    loop {
+      let _ = w.changed().await;
+
+      if let Some(inner) = w.borrow().as_ref() {
+        match inner {
+          Ok(inner) => match inner.connection.close_reason() {
+            None => return Ok(inner.clone()),
+            Some(e) => {
+              if !is_retry_error(&e) {
+                return Err(e.into());
+              }
+            }
+          },
+          Err(e) => {
+            return Err(e.clone());
+          }
+        }
+      }
+    }
+  }
+
+  // compat method with other common connection types, keep signature the same
   pub async fn accept(
     &self,
   ) -> Result<(TunnelStream, TunnelAddr), std::io::Error> {
-    let (tx, mut rx) = self.connection.accept_bi().await?;
+    loop {
+      let inner = self.active().await.map_err(std::io::Error::other)?;
 
-    let StreamHeader::Stream {
-      remote_addr,
-      local_addr,
-    } = read_message(&mut rx).await.map_err(std::io::Error::other)?
-    else {
-      return Err(std::io::Error::other(Error::UnexpectedHeader));
-    };
+      let (tx, mut rx) = match inner.connection.accept_bi().await {
+        Ok(c) => c,
+        Err(e) => {
+          if is_retry_error(&e) {
+            continue;
+          }
+          return Err(e.into());
+        }
+      };
 
-    Ok((
-      TunnelStream {
-        tx,
-        rx,
-        local_addr,
-        remote_addr,
-      },
-      TunnelAddr {
-        hostname: None,
-        socket: remote_addr,
-      },
-    ))
+      match read_message(&mut rx).await {
+        Ok(StreamHeader::Stream {
+          remote_addr,
+          local_addr,
+        }) => {
+          return Ok((
+            TunnelStream {
+              tx,
+              rx,
+              local_addr,
+              remote_addr,
+            },
+            TunnelAddr {
+              hostname: None,
+              socket: remote_addr,
+            },
+          ));
+        }
+        Err(e) => {
+          if let Error::QuinnConnection(qe) = e {
+            if is_retry_error(&qe) {
+              continue;
+            }
+            return Err(qe.into());
+          }
+          return Err(std::io::Error::other(e));
+        }
+        _ => {
+          return Err(std::io::Error::other(Error::UnexpectedHeader));
+        }
+      }
+    }
+  }
+
+  pub fn metadata(&self) -> Option<Metadata> {
+    self
+      .active
+      .borrow()
+      .as_ref()
+      .and_then(|b| b.as_ref().ok())
+      .map(|c| c.metadata.clone())
   }
 
   pub async fn create_agent_stream(&self) -> Result<TunnelStream, Error> {
-    let (mut tx, rx) = self.connection.open_bi().await?;
+    let ((mut tx, rx), remote_addr) = loop {
+      let inner = self.active().await?;
+      match inner.connection.open_bi().await {
+        Ok(c) => break (c, inner.connection.remote_address()),
+        Err(e) => {
+          if is_retry_error(&e) {
+            continue;
+          }
+          return Err(e.into());
+        }
+      };
+    };
+
     write_message(&mut tx, StreamHeader::Agent {}).await?;
     Ok(TunnelStream {
       tx,
       rx,
       local_addr: self.endpoint.local_addr()?,
-      remote_addr: self.connection.remote_address(),
+      remote_addr,
     })
   }
 
   pub async fn close(&self, code: impl Into<quinn::VarInt>, reason: &[u8]) {
-    self.connection.close(code.into(), reason);
+    self.active.send_replace(Some(Err(Error::QuinnConnection(
+      quinn::ConnectionError::LocallyClosed,
+    ))));
+    self.endpoint.close(code.into(), reason);
     self.endpoint.wait_idle().await;
+  }
+}
+
+fn is_retry_error(e: &quinn::ConnectionError) -> bool {
+  match e {
+    quinn::ConnectionError::ApplicationClosed(_)
+    | quinn::ConnectionError::ConnectionClosed(_)
+    | quinn::ConnectionError::TimedOut
+    | quinn::ConnectionError::Reset
+    | quinn::ConnectionError::LocallyClosed => true,
+    quinn::ConnectionError::VersionMismatch
+    | quinn::ConnectionError::CidsExhausted
+    | quinn::ConnectionError::TransportError(_) => false,
   }
 }
 
@@ -489,6 +776,7 @@ impl OwnedWriteHalf {
 
 /// Header for new streams
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum StreamHeader {
   Control {},
   Stream {
@@ -500,6 +788,7 @@ pub enum StreamHeader {
 
 /// Messages for control streams
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum ControlMessage {
   AuthenticateApp {
     token: String,
@@ -519,26 +808,32 @@ pub enum ControlMessage {
   Migrate {},
 }
 
-pub async fn write_message<
-  T: serde::Serialize,
-  W: tokio::io::AsyncWrite + Unpin,
->(
-  tx: &mut W,
+// Using this function instead of WriteExt::write_u32_le to avoid std::io::Error
+async fn write_u32_le(tx: &mut quinn::SendStream, v: u32) -> Result<(), Error> {
+  Ok(tx.write_all(&v.to_le_bytes()).await?)
+}
+
+// Using this function instead of WriteExt::read_u32_le to avoid std::io::Error
+async fn read_u32_le(rx: &mut quinn::RecvStream) -> Result<u32, Error> {
+  let mut data = [0; std::mem::size_of::<u32>()];
+  rx.read_exact(&mut data).await?;
+  Ok(u32::from_le_bytes(data))
+}
+
+pub async fn write_message<T: serde::Serialize>(
+  tx: &mut quinn::SendStream,
   message: T,
 ) -> Result<(), Error> {
   let data = serde_json::to_vec(&message)?;
-  tx.write_u32_le(data.len() as _).await?;
+  write_u32_le(tx, data.len() as _).await?;
   tx.write_all(&data).await?;
   Ok(())
 }
 
-pub async fn read_message<
-  T: serde::de::DeserializeOwned,
-  R: tokio::io::AsyncRead + Unpin,
->(
-  rx: &mut R,
+pub async fn read_message<T: serde::de::DeserializeOwned>(
+  rx: &mut quinn::RecvStream,
 ) -> Result<T, Error> {
-  let length = rx.read_u32_le().await?;
+  let length = read_u32_le(rx).await?;
   let mut data = vec![0; length as usize];
   rx.read_exact(&mut data).await?;
   let message = serde_json::from_slice(&data)?;
