@@ -211,7 +211,13 @@ impl InnerConnection {
       return Err(Error::UnsupportedVersion);
     }
 
-    write_message(&mut control.0, StreamHeader::Control {}).await?;
+    write_message(
+      &mut control.0,
+      StreamHeader::Control {
+        metadata: Some(outer.connect_info.metadata.clone()),
+      },
+    )
+    .await?;
     write_message(
       &mut control.0,
       match outer.connect_info.authentication.clone() {
@@ -276,6 +282,7 @@ impl InnerConnection {
 #[derive(Debug)]
 struct ConnectInfo {
   authentication: Authentication,
+  metadata: HashMap<String, String>,
   addr: SocketAddr,
   server_name: String,
 }
@@ -294,6 +301,7 @@ impl TunnelConnection {
     server_name: String,
     tls_config: quinn::rustls::ClientConfig,
     authentication: Authentication,
+    metadata: HashMap<String, String>,
   ) -> Result<(Self, Events), Error> {
     Self::connect_with(
       UdpSocket::bind(("::", 0))?,
@@ -301,6 +309,7 @@ impl TunnelConnection {
       server_name,
       tls_config,
       authentication,
+      metadata,
     )
     .await
   }
@@ -311,6 +320,7 @@ impl TunnelConnection {
     server_name: String,
     mut tls_config: quinn::rustls::ClientConfig,
     authentication: Authentication,
+    metadata: HashMap<String, String>,
   ) -> Result<(Self, Events), Error> {
     let config = quinn::EndpointConfig::default();
     let mut endpoint = quinn::Endpoint::new(
@@ -341,6 +351,7 @@ impl TunnelConnection {
       endpoint,
       connect_info: Arc::new(ConnectInfo {
         authentication,
+        metadata,
         addr,
         server_name,
       }),
@@ -778,7 +789,9 @@ impl OwnedWriteHalf {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum StreamHeader {
-  Control {},
+  Control {
+    metadata: Option<HashMap<String, String>>,
+  },
   Stream {
     local_addr: SocketAddr,
     remote_addr: SocketAddr,

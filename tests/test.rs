@@ -3,6 +3,7 @@ use deno_tunnel::Error;
 use deno_tunnel::Event;
 use deno_tunnel::Metadata;
 use deno_tunnel::TunnelConnection;
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::process::Stdio;
@@ -90,6 +91,10 @@ async fn connect_for(stream: &mut TcpStream, routing_id: &str, mode: Mode) {
 async fn test_basic() {
   let server = server().await;
 
+  let mut metadata = HashMap::new();
+  metadata.insert("a".into(), "1".into());
+  metadata.insert("b".into(), "2".into());
+
   let (c, mut events) = TunnelConnection::connect(
     server.qaddr,
     "localhost".into(),
@@ -99,6 +104,7 @@ async fn test_basic() {
       org: "org".into(),
       app: "app".into(),
     },
+    metadata.clone(),
   )
   .await
   .unwrap();
@@ -108,7 +114,7 @@ async fn test_basic() {
     Metadata {
       env: Default::default(),
       hostnames: vec!["org-app.localhost".into()],
-      metadata: Default::default()
+      metadata,
     }
   );
 
@@ -154,6 +160,7 @@ async fn test_unauthorized() {
       org: "org".into(),
       app: "app".into(),
     },
+    Default::default(),
   )
   .await;
 
@@ -173,6 +180,7 @@ async fn test_not_found() {
       org: "unknown".into(),
       app: "app".into(),
     },
+    Default::default(),
   )
   .await;
 
@@ -192,6 +200,7 @@ async fn test_disconnect() {
       org: "org".into(),
       app: "app".into(),
     },
+    Default::default(),
   )
   .await
   .unwrap();
@@ -222,6 +231,7 @@ async fn test_migrate() {
       org: "org".into(),
       app: "app".into(),
     },
+    Default::default(),
   )
   .await
   .unwrap();

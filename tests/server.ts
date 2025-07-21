@@ -216,6 +216,7 @@ async function handleQuicConnection(conn: Deno.QuicConn) {
     conn.close({ closeCode: CLOSE_PROTOCOL, reason: "unexpected header" });
     return;
   }
+  const { metadata } = header;
 
   let routingId;
   const auth = await readStreamMessage<ControlMessage>(reader);
@@ -251,7 +252,7 @@ async function handleQuicConnection(conn: Deno.QuicConn) {
     hostnames: [`${routingId}.localhost`],
     addr: serializeAddr(endpoint.addr),
     env: {},
-    metadata: {},
+    metadata: metadata || {},
   });
 
   const control = {
@@ -301,6 +302,7 @@ async function writeUint32LE(
 
 type StreamHeader = {
   headerType: "Control";
+  metadata?: Record<string, string>,
 } | {
   headerType: "Stream";
   local_addr: string;
