@@ -50,6 +50,8 @@ pub enum Error {
   NotFound,
   #[error("Migrate")]
   Migrate,
+  #[error("Invalid message length")]
+  MessageLengthInvalid,
 }
 
 impl From<quinn::ConnectionError> for Error {
@@ -847,6 +849,9 @@ pub async fn read_message<T: serde::de::DeserializeOwned>(
   rx: &mut quinn::RecvStream,
 ) -> Result<T, Error> {
   let length = read_u32_le(rx).await?;
+  if length > 1024 * 512 {
+    return Err(Error::MessageLengthInvalid);
+  }
   let mut data = vec![0; length as usize];
   rx.read_exact(&mut data).await?;
   let message = serde_json::from_slice(&data)?;
