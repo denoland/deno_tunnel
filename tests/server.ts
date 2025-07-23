@@ -1,7 +1,7 @@
 import { type HeaderInfo, HTTPParser } from "npm:http-parser-js";
 import { Buffer } from "node:buffer";
 
-const VERSION = 1;
+const VERSION = 2;
 const CLOSE_GENERIC = 0;
 const CLOSE_PROTOCOL = 1;
 const CLOSE_UNAUTHORIZED = 2;
@@ -273,9 +273,12 @@ async function handleQuicConnection(conn: Deno.QuicConn) {
     }
   });
 
-  await writeStreamMessage<ControlMessage>(writer, {
-    headerType: "Routed",
-  });
+  const listening = await readStreamMessage<ControlMessage>(reader);
+  if (listening.headerType === "Listening") {
+    await writeStreamMessage<ControlMessage>(writer, {
+      headerType: "Routed",
+    });
+  }
 }
 
 function serializeAddr(addr: Deno.NetAddr) {
@@ -325,6 +328,8 @@ type ControlMessage = {
   addr: string;
   hostnames: string[];
   env: Record<string, string>;
+} | {
+  headerType: "Listening";
 } | {
   headerType: "Routed";
 } | {

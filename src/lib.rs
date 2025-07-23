@@ -5,7 +5,10 @@ use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::net::UdpSocket;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use quinn::crypto::rustls::QuicClientConfig;
 use tokio::io::AsyncRead;
@@ -13,7 +16,7 @@ use tokio::io::AsyncWrite;
 
 pub use quinn;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 pub const CLOSE_GENERIC: u32 = 0;
 pub const CLOSE_PROTOCOL: u32 = 1;
@@ -195,6 +198,8 @@ struct InnerConnection {
   connection: quinn::Connection,
   local_addr: TunnelAddr,
   metadata: Metadata,
+  sent_listening: AtomicBool,
+  control_tx: Mutex<quinn::SendStream>,
 }
 
 impl InnerConnection {
@@ -207,21 +212,21 @@ impl InnerConnection {
 
     let connection = connecting.await?;
 
-    let mut control = connection.open_bi().await?;
-    write_u32_le(&mut control.0, VERSION).await?;
-    if read_u32_le(&mut control.1).await? != VERSION {
+    let (mut control_tx, mut control_rx) = connection.open_bi().await?;
+    write_u32_le(&mut control_tx, VERSION).await?;
+    if read_u32_le(&mut control_rx).await? != VERSION {
       return Err(Error::UnsupportedVersion);
     }
 
     write_message(
-      &mut control.0,
+      &mut control_tx,
       StreamHeader::Control {
         metadata: Some(outer.connect_info.metadata.clone()),
       },
     )
     .await?;
     write_message(
-      &mut control.0,
+      &mut control_tx,
       match outer.connect_info.authentication.clone() {
         Authentication::App { token, org, app } => {
           ControlMessage::AuthenticateApp { token, org, app }
@@ -238,14 +243,14 @@ impl InnerConnection {
       hostnames,
       env,
       metadata,
-    } = read_message(&mut control.1).await?
+    } = read_message(&mut control_rx).await?
     else {
       return Err(Error::UnexpectedHeader);
     };
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(1);
     tokio::spawn(async move {
-      while let Ok(message) = read_message(&mut control.1).await {
+      while let Ok(message) = read_message(&mut control_rx).await {
         let event = match message {
           ControlMessage::Routed {} => InternalEvent::Routed,
           ControlMessage::Migrate {} => InternalEvent::Migrate,
@@ -275,9 +280,19 @@ impl InnerConnection {
         connection,
         local_addr,
         metadata,
+        sent_listening: AtomicBool::new(false),
+        control_tx: Mutex::new(control_tx),
       },
       event_rx,
     ))
+  }
+
+  async fn listening(&self) {
+    if self.sent_listening.swap(true, Ordering::SeqCst) {
+      return;
+    }
+    let mut stream = self.control_tx.lock().await;
+    let _ = write_message(&mut stream, ControlMessage::Listening {}).await;
   }
 }
 
@@ -534,6 +549,8 @@ impl TunnelConnection {
   ) -> Result<(TunnelStream, TunnelAddr), std::io::Error> {
     loop {
       let inner = self.active().await.map_err(std::io::Error::other)?;
+
+      inner.listening().await;
 
       let (tx, mut rx) = match inner.connection.accept_bi().await {
         Ok(c) => c,
@@ -819,6 +836,7 @@ pub enum ControlMessage {
     hostnames: Vec<String>,
     env: HashMap<String, String>,
   },
+  Listening {},
   Routed {},
   Migrate {},
 }

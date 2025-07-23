@@ -118,8 +118,6 @@ async fn test_basic() {
     }
   );
 
-  assert_eq!(events.next().await.unwrap(), Event::Routed);
-
   let t = tokio::spawn(async move {
     let mut stream = TcpStream::connect(server.taddr).await.unwrap();
 
@@ -142,6 +140,8 @@ async fn test_basic() {
 
     stream.write_all(b"meow back").await.unwrap();
   });
+
+  assert_eq!(events.next().await.unwrap(), Event::Routed);
 
   t.await.unwrap();
   q.await.unwrap();
@@ -191,7 +191,7 @@ async fn test_not_found() {
 async fn test_disconnect() {
   let server = server().await;
 
-  let (_, mut events) = TunnelConnection::connect(
+  let (conn, mut events) = TunnelConnection::connect(
     server.qaddr,
     "localhost".into(),
     server.tls_config,
@@ -204,6 +204,8 @@ async fn test_disconnect() {
   )
   .await
   .unwrap();
+
+  tokio::spawn(async move { while conn.accept().await.is_ok() {} });
 
   assert_eq!(events.next().await.unwrap(), Event::Routed);
 
@@ -222,7 +224,7 @@ async fn test_disconnect() {
 async fn test_migrate() {
   let server = server().await;
 
-  let (_, mut events) = TunnelConnection::connect(
+  let (conn, mut events) = TunnelConnection::connect(
     server.qaddr,
     "localhost".into(),
     server.tls_config,
@@ -235,6 +237,8 @@ async fn test_migrate() {
   )
   .await
   .unwrap();
+
+  tokio::spawn(async move { while conn.accept().await.is_ok() {} });
 
   assert_eq!(events.next().await.unwrap(), Event::Routed);
 
