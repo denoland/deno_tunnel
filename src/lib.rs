@@ -251,6 +251,7 @@ impl InnerConnection {
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(1);
     tokio::spawn(async move {
       while let Ok(message) = read_message(&mut control_rx).await {
+        tracing::trace!(?message);
         let event = match message {
           ControlMessage::Routed {} => InternalEvent::Routed,
           ControlMessage::Migrate {} => InternalEvent::Migrate,
@@ -412,6 +413,7 @@ impl TunnelConnection {
               match InnerConnection::connect(this.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
+                  tracing::debug!("connect: {e}");
                   if let Error::QuinnConnection(qe) = &e {
                     if is_retry_error(qe) {
                       retries += 1;
@@ -620,6 +622,7 @@ impl TunnelConnection {
     };
 
     write_message(&mut tx, StreamHeader::Agent {}).await?;
+
     Ok(TunnelStream {
       tx,
       rx,
@@ -637,10 +640,19 @@ impl TunnelConnection {
   }
 }
 
+fn is_retry_code(c: u64) -> bool {
+  !matches!(
+    c as u32,
+    CLOSE_PROTOCOL | CLOSE_NOT_FOUND | CLOSE_UNAUTHORIZED
+  )
+}
+
 fn is_retry_error(e: &quinn::ConnectionError) -> bool {
   match e {
-    quinn::ConnectionError::ApplicationClosed(_)
-    | quinn::ConnectionError::ConnectionClosed(_)
+    quinn::ConnectionError::ApplicationClosed(c) => {
+      is_retry_code(c.error_code.into_inner())
+    }
+    quinn::ConnectionError::ConnectionClosed(_)
     | quinn::ConnectionError::TimedOut
     | quinn::ConnectionError::Reset
     | quinn::ConnectionError::LocallyClosed => true,
