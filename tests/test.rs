@@ -21,8 +21,13 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex as AsyncMutex;
 
 struct Server {
+  events: (
+    tokio::sync::mpsc::Sender<Event>,
+    AsyncMutex<tokio::sync::mpsc::Receiver<Event>>,
+  ),
   endpoint: quinn::Endpoint,
   qaddr: SocketAddr,
   #[allow(clippy::type_complexity)]
@@ -111,6 +116,18 @@ impl Server {
     tokio::io::join(s.1, s.0)
   }
 
+  fn on_event(self: &Arc<Self>) -> impl Fn(Event) + use<> {
+    let this = self.clone();
+    move |event: Event| {
+      let this = this.clone();
+      tokio::spawn(async move { this.events.0.send(event).await });
+    }
+  }
+
+  async fn next_event(&self) -> Option<Event> {
+    self.events.1.lock().await.recv().await
+  }
+
   fn tls_config(&self) -> quinn::rustls::ClientConfig {
     let mut reader = Cursor::new(include_bytes!("./RootCA.crt"));
     let certs = rustls_pemfile::certs(&mut reader)
@@ -130,7 +147,7 @@ impl Drop for Server {
   }
 }
 
-async fn server() -> Server {
+async fn server() -> Arc<Server> {
   let mut reader = Cursor::new(include_bytes!("./localhost.crt"));
   let cert_chain = rustls_pemfile::certs(&mut reader)
     .filter_map(|v| v.ok())
@@ -252,11 +269,13 @@ async fn server() -> Server {
     }
   });
 
-  Server {
+  let (tx, rx) = tokio::sync::mpsc::channel(1);
+  Arc::new(Server {
+    events: (tx, AsyncMutex::new(rx)),
     endpoint,
     qaddr,
     connections,
-  }
+  })
 }
 
 #[tokio::test]
@@ -267,7 +286,7 @@ async fn test_basic() {
   metadata.insert("a".into(), "1".into());
   metadata.insert("b".into(), "2".into());
 
-  let (c, mut events) = TunnelConnection::connect(
+  let c = TunnelConnection::connect(
     server.qaddr,
     "localhost".into(),
     server.tls_config(),
@@ -277,6 +296,7 @@ async fn test_basic() {
       app: "app".into(),
     },
     metadata.clone(),
+    server.on_event(),
   )
   .await
   .unwrap();
@@ -290,8 +310,9 @@ async fn test_basic() {
     }
   );
 
+  let server2 = server.clone();
   let t = tokio::spawn(async move {
-    let mut stream = server.stream("org-app").await;
+    let mut stream = server2.stream("org-app").await;
 
     stream.write_all(b"hello!").await.unwrap();
 
@@ -311,7 +332,10 @@ async fn test_basic() {
     stream.write_all(b"meow back").await.unwrap();
   });
 
-  assert_eq!(events.next().await.unwrap(), Event::Routed);
+  assert!(matches!(
+    server.next_event().await.unwrap(),
+    Event::Routed(_)
+  ));
 
   t.await.unwrap();
   q.await.unwrap();
@@ -331,6 +355,7 @@ async fn test_unauthorized() {
       app: "app".into(),
     },
     Default::default(),
+    server.on_event(),
   )
   .await;
 
@@ -351,6 +376,7 @@ async fn test_not_found() {
       app: "app".into(),
     },
     Default::default(),
+    server.on_event(),
   )
   .await;
 
@@ -361,7 +387,7 @@ async fn test_not_found() {
 async fn test_disconnect() {
   let server = server().await;
 
-  let (conn, mut events) = TunnelConnection::connect(
+  let conn = TunnelConnection::connect(
     server.qaddr,
     "localhost".into(),
     server.tls_config(),
@@ -371,29 +397,37 @@ async fn test_disconnect() {
       app: "app".into(),
     },
     Default::default(),
+    server.on_event(),
   )
   .await
   .unwrap();
 
   tokio::spawn(async move { while conn.accept().await.is_ok() {} });
 
-  assert_eq!(events.next().await.unwrap(), Event::Routed);
+  assert!(matches!(
+    server.next_event().await.unwrap(),
+    Event::Routed(_)
+  ));
 
   server.disconnect("org-app").await;
 
-  assert_eq!(
-    events.next().await.unwrap(),
-    Event::Reconnect(Duration::from_secs(3))
-  );
+  let duration = Duration::from_secs(3);
+  assert!(matches!(
+    server.next_event().await.unwrap(),
+    Event::Reconnect(d, Some(_)) if d == duration
+  ));
 
-  assert_eq!(events.next().await.unwrap(), Event::Routed);
+  assert!(matches!(
+    server.next_event().await.unwrap(),
+    Event::Routed(_)
+  ));
 }
 
 #[tokio::test]
 async fn test_migrate() {
   let server = server().await;
 
-  let (conn, mut events) = TunnelConnection::connect(
+  let conn = TunnelConnection::connect(
     server.qaddr,
     "localhost".into(),
     server.tls_config(),
@@ -403,24 +437,31 @@ async fn test_migrate() {
       app: "app".into(),
     },
     Default::default(),
+    server.on_event(),
   )
   .await
   .unwrap();
 
   tokio::spawn(async move { while conn.accept().await.is_ok() {} });
 
-  assert_eq!(events.next().await.unwrap(), Event::Routed);
+  assert!(matches!(
+    server.next_event().await.unwrap(),
+    Event::Routed(_)
+  ));
 
   server.migrate("org-app").await;
 
-  assert_eq!(events.next().await.unwrap(), Event::Routed);
+  assert!(matches!(
+    server.next_event().await.unwrap(),
+    Event::Routed(_)
+  ));
 }
 
 #[tokio::test]
 async fn test_agent() {
   let server = server().await;
 
-  let (conn, _) = TunnelConnection::connect(
+  let conn = TunnelConnection::connect(
     server.qaddr,
     "localhost".into(),
     server.tls_config(),
@@ -430,6 +471,7 @@ async fn test_agent() {
       app: "app".into(),
     },
     Default::default(),
+    server.on_event(),
   )
   .await
   .unwrap();

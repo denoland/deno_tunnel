@@ -155,30 +155,18 @@ pub struct Metadata {
 }
 
 /// Server event
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Event {
   /// All endpoints are routed
-  Routed,
+  Routed(TunnelAddr),
   /// Client will reconnect after the given duration
-  Reconnect(Duration),
+  Reconnect(Duration, Option<Error>),
 }
 
 enum InternalEvent {
-  Routed,
+  Routed(TunnelAddr),
   Migrate,
-}
-
-/// Events from the server
-#[derive(Debug)]
-pub struct Events {
-  event_rx: tokio::sync::mpsc::Receiver<Event>,
-}
-
-impl Events {
-  pub async fn next(&mut self) -> Option<Event> {
-    self.event_rx.recv().await
-  }
 }
 
 #[derive(Debug, Clone)]
@@ -248,27 +236,32 @@ impl InnerConnection {
       return Err(Error::UnexpectedHeader);
     };
 
-    let (event_tx, event_rx) = tokio::sync::mpsc::channel(1);
-    tokio::spawn(async move {
-      while let Ok(message) = read_message(&mut control_rx).await {
-        tracing::trace!(?message);
-        let event = match message {
-          ControlMessage::Routed {} => InternalEvent::Routed,
-          ControlMessage::Migrate {} => InternalEvent::Migrate,
-          _ => {
-            continue;
-          }
-        };
-        if event_tx.send(event).await.is_err() {
-          break;
-        }
-      }
-    });
-
     let local_addr = TunnelAddr {
       socket: addr,
       hostname: hostnames.first().cloned(),
     };
+
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(1);
+    tokio::spawn({
+      let local_addr = local_addr.clone();
+      async move {
+        while let Ok(message) = read_message(&mut control_rx).await {
+          tracing::trace!(?message);
+          let event = match message {
+            ControlMessage::Routed {} => {
+              InternalEvent::Routed(local_addr.clone())
+            }
+            ControlMessage::Migrate {} => InternalEvent::Migrate,
+            _ => {
+              continue;
+            }
+          };
+          if event_tx.send(event).await.is_err() {
+            break;
+          }
+        }
+      }
+    });
 
     let metadata = Metadata {
       hostnames,
@@ -320,7 +313,8 @@ impl TunnelConnection {
     tls_config: quinn::rustls::ClientConfig,
     authentication: Authentication,
     metadata: HashMap<String, String>,
-  ) -> Result<(Self, Events), Error> {
+    on_event: impl Fn(Event) + Send + 'static,
+  ) -> Result<Self, Error> {
     Self::connect_with(
       UdpSocket::bind(("::", 0))?,
       addr,
@@ -328,6 +322,7 @@ impl TunnelConnection {
       tls_config,
       authentication,
       metadata,
+      on_event,
     )
     .await
   }
@@ -339,7 +334,8 @@ impl TunnelConnection {
     mut tls_config: quinn::rustls::ClientConfig,
     authentication: Authentication,
     metadata: HashMap<String, String>,
-  ) -> Result<(Self, Events), Error> {
+    on_event: impl Fn(Event) + Send + 'static,
+  ) -> Result<Self, Error> {
     let config = quinn::EndpointConfig::default();
     let mut endpoint = quinn::Endpoint::new(
       config,
@@ -363,8 +359,6 @@ impl TunnelConnection {
 
     endpoint.set_default_client_config(client_config);
 
-    let (event_tx, event_rx) = tokio::sync::mpsc::channel(1);
-
     let this = Self {
       endpoint,
       connect_info: Arc::new(ConnectInfo {
@@ -382,6 +376,7 @@ impl TunnelConnection {
         let this2 = this.clone();
         let r = async move {
           let mut retries = 0;
+          let mut reason = None;
           let mut watch = this.active.subscribe();
 
           'outer: loop {
@@ -391,10 +386,7 @@ impl TunnelConnection {
 
             if retries > 0 {
               let d = Duration::from_secs((retries * 3).min(30));
-              let event_tx = event_tx.clone();
-              tokio::spawn(async move {
-                let _ = event_tx.send(Event::Reconnect(d)).await;
-              });
+              on_event(Event::Reconnect(d, reason.take()));
               let s = tokio::time::sleep(d);
               tokio::pin!(s);
               loop {
@@ -416,6 +408,7 @@ impl TunnelConnection {
                   tracing::debug!("connect: {e}");
                   if let Error::QuinnConnection(qe) = &e {
                     if is_retry_error(qe) {
+                      reason = Some(e);
                       retries += 1;
                       continue;
                     } else {
@@ -451,11 +444,8 @@ impl TunnelConnection {
                       retries = 0;
                       continue 'outer;
                     }
-                    InternalEvent::Routed => {
-                      let event_tx = event_tx.clone();
-                      tokio::spawn(async move {
-                        let _ = event_tx.send(Event::Routed).await;
-                      });
+                    InternalEvent::Routed(addr) => {
+                      on_event(Event::Routed(addr));
                     }
                   }
                 }
@@ -469,6 +459,7 @@ impl TunnelConnection {
 
             if is_retry_error(&e) {
               this.active.send_replace(None);
+              reason = Some(e.into());
               retries += 1;
             } else {
               return Err(e.into());
@@ -486,9 +477,7 @@ impl TunnelConnection {
 
     this.active().await?;
 
-    let events = Events { event_rx };
-
-    Ok((this, events))
+    Ok(this)
   }
 }
 
