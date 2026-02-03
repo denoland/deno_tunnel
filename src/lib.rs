@@ -1,18 +1,19 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 
+use quinn::crypto::rustls::QuicClientConfig;
+use socket2 as s2;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::sync::Mutex;
-
-use quinn::crypto::rustls::QuicClientConfig;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
+use tokio::sync::Mutex;
 
 pub use quinn;
 
@@ -315,8 +316,16 @@ impl TunnelConnection {
     metadata: HashMap<String, String>,
     on_event: impl Fn(Event) + Send + 'static,
   ) -> Result<Self, Error> {
+    let socket = s2::Socket::new(
+      s2::Domain::IPV6,
+      s2::Type::DGRAM,
+      Some(s2::Protocol::UDP),
+    )?;
+    socket.set_only_v6(false)?; // on windows this defaults to true
+    socket.bind(&SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0).into())?;
+
     Self::connect_with(
-      UdpSocket::bind(("::", 0))?,
+      socket.into(),
       addr,
       server_name,
       tls_config,
